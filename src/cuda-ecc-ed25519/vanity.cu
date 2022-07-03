@@ -35,8 +35,7 @@ typedef struct {
 void            vanity_setup(config& vanity);
 void            vanity_run(config& vanity);
 void __global__ vanity_init(unsigned long long int* seed, curandState* state);
-void __global__ vanity_scan(curandState* state, int* keys_found, int* gpu, int* execution_count);
-bool __device__ b58enc(char* b58, size_t* b58sz, uint8_t* data, size_t binsz);
+void __global__ vanity_scan(curandState* state, int* keys_found, unsigned int* best_found, int* gpu, int* execution_count);
 
 /* -- Entry Point ----------------------------------------------------------- */
 
@@ -96,7 +95,7 @@ void vanity_setup(config &vanity) {
 		cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocks, vanity_scan, blockSize, 0);
 
 		// Output Device Details
-		// 
+		//
 		// Our kernels currently don't take advantage of data locality
 		// or how warp execution works, so each thread can be thought
 		// of as a totally independent thread of execution (bad). On
@@ -124,15 +123,15 @@ void vanity_setup(config &vanity) {
 			device.maxGridSize[2]
 		);
 
-                // the random number seed is uniquely generated each time the program 
+                // the random number seed is uniquely generated each time the program
                 // is run, from the operating system entropy
 
 		unsigned long long int rseed = makeSeed();
 		printf("Initialising from entropy: %llu\n",rseed);
 
 		unsigned long long int* dev_rseed;
-	        cudaMalloc((void**)&dev_rseed, sizeof(unsigned long long int));		
-                cudaMemcpy( dev_rseed, &rseed, sizeof(unsigned long long int), cudaMemcpyHostToDevice ); 
+	        cudaMalloc((void**)&dev_rseed, sizeof(unsigned long long int));
+                cudaMemcpy( dev_rseed, &rseed, sizeof(unsigned long long int), cudaMemcpyHostToDevice );
 
 		cudaMalloc((void **)&(vanity.states[i]), maxActiveBlocks * blockSize * sizeof(curandState));
 		vanity_init<<<maxActiveBlocks, blockSize>>>(dev_rseed, vanity.states[i]);
@@ -145,9 +144,9 @@ void vanity_run(config &vanity) {
 	int gpuCount = 0;
 	cudaGetDeviceCount(&gpuCount);
 
-	unsigned long long int  executions_total = 0; 
-	unsigned long long int  executions_this_iteration; 
-	int  executions_this_gpu; 
+	unsigned long long int  executions_total = 0;
+	unsigned long long int  executions_this_iteration;
+	int  executions_this_gpu;
         int* dev_executions_this_gpu[100];
 
         int  keys_found_total = 0;
@@ -171,12 +170,14 @@ void vanity_run(config &vanity) {
 
 			int* dev_g;
 	                cudaMalloc((void**)&dev_g, sizeof(int));
-                	cudaMemcpy( dev_g, &g, sizeof(int), cudaMemcpyHostToDevice ); 
+                	cudaMemcpy( dev_g, &g, sizeof(int), cudaMemcpyHostToDevice );
 
-	                cudaMalloc((void**)&dev_keys_found[g], sizeof(int));		
-	                cudaMalloc((void**)&dev_executions_this_gpu[g], sizeof(int));		
+			unsigned int* best;
+			cudaMalloc((void**)&best, sizeof(unsigned int));
+	                cudaMalloc((void**)&dev_keys_found[g], sizeof(int));
+	                cudaMalloc((void**)&dev_executions_this_gpu[g], sizeof(int));
 
-			vanity_scan<<<maxActiveBlocks, blockSize>>>(vanity.states[g], dev_keys_found[g], dev_g, dev_executions_this_gpu[g]);
+			vanity_scan<<<maxActiveBlocks, blockSize>>>(vanity.states[g], dev_keys_found[g], best, dev_g, dev_executions_this_gpu[g]);
 
 		}
 
@@ -189,13 +190,13 @@ void vanity_run(config &vanity) {
 		auto finish = std::chrono::high_resolution_clock::now();
 
 		for (int g = 0; g < gpuCount; ++g) {
-                	cudaMemcpy( &keys_found_this_iteration, dev_keys_found[g], sizeof(int), cudaMemcpyDeviceToHost ); 
-                	keys_found_total += keys_found_this_iteration; 
+                	cudaMemcpy( &keys_found_this_iteration, dev_keys_found[g], sizeof(int), cudaMemcpyDeviceToHost );
+                	keys_found_total += keys_found_this_iteration;
 			//printf("GPU %d found %d keys\n",g,keys_found_this_iteration);
 
-                	cudaMemcpy( &executions_this_gpu, dev_executions_this_gpu[g], sizeof(int), cudaMemcpyDeviceToHost ); 
-                	executions_this_iteration += executions_this_gpu * ATTEMPTS_PER_EXECUTION; 
-                	executions_total += executions_this_gpu * ATTEMPTS_PER_EXECUTION; 
+                	cudaMemcpy( &executions_this_gpu, dev_executions_this_gpu[g], sizeof(int), cudaMemcpyDeviceToHost );
+                	executions_this_iteration += executions_this_gpu * ATTEMPTS_PER_EXECUTION;
+                	executions_total += executions_this_gpu * ATTEMPTS_PER_EXECUTION;
                         //printf("GPU %d executions: %d\n",g,executions_this_gpu);
 		}
 
@@ -213,8 +214,8 @@ void vanity_run(config &vanity) {
 
                 if ( keys_found_total >= STOP_AFTER_KEYS_FOUND ) {
                 	printf("Enough keys found, Done! \n");
-		        exit(0);	
-		}	
+		        exit(0);
+		}
 	}
 
 	printf("Iterations complete, Done!\n");
@@ -223,26 +224,14 @@ void vanity_run(config &vanity) {
 /* -- CUDA Vanity Functions ------------------------------------------------- */
 
 void __global__ vanity_init(unsigned long long int* rseed, curandState* state) {
-	int id = threadIdx.x + (blockIdx.x * blockDim.x);  
+	int id = threadIdx.x + (blockIdx.x * blockDim.x);
 	curand_init(*rseed + id, id, 0, &state[id]);
 }
 
-void __global__ vanity_scan(curandState* state, int* keys_found, int* gpu, int* exec_count) {
+void __global__ vanity_scan(curandState* state, int* keys_found, unsigned int* best_found, int* gpu, int* exec_count) {
 	int id = threadIdx.x + (blockIdx.x * blockDim.x);
 
-        atomicAdd(exec_count, 1);
-
-	// SMITH - should really be passed in, but hey ho
-    	int prefix_letter_counts[MAX_PATTERNS];
-    	for (unsigned int n = 0; n < sizeof(prefixes) / sizeof(prefixes[0]); ++n) {
-        	if ( MAX_PATTERNS == n ) {
-            		printf("NEVER SPEAK TO ME OR MY SON AGAIN");
-            		return;
-        	}
-        	int letter_count = 0;
-        	for(; prefixes[n][letter_count]!=0; letter_count++);
-        	prefix_letter_counts[n] = letter_count;
-    	}
+  atomicAdd(exec_count, 1);
 
 	// Local Kernel State
 	ge_p3 A;
@@ -250,8 +239,6 @@ void __global__ vanity_scan(curandState* state, int* keys_found, int* gpu, int* 
 	unsigned char seed[32]     = {0};
 	unsigned char publick[32]  = {0};
 	unsigned char privatek[64] = {0};
-	char key[256]              = {0};
-	//char pkey[256]             = {0};
 
 	// Start from an Initial Random Seed (Slow)
 	// NOTE: Insecure random number generator, do not use keys generator by
@@ -265,6 +252,8 @@ void __global__ vanity_scan(curandState* state, int* keys_found, int* gpu, int* 
 
 	// Generate Random Key Data
 	sha512_context md;
+
+	unsigned int best_local = 0;
 
 	// I've unrolled all the MD5 calls and special cased them to 32 byte
 	// inputs, which eliminates a lot of branching. This is a pretty poor
@@ -289,7 +278,7 @@ void __global__ vanity_scan(curandState* state, int* keys_found, int* gpu, int* 
 		md.state[7] = UINT64_C(0x5be0cd19137e2179);
 
 		// sha512_update inlined
-		// 
+		//
 		// All `if` statements from this function are eliminated if we
 		// will only ever hash a 32 byte seed input. So inlining this
 		// has a drastic speed improvement on GPUs.
@@ -307,7 +296,7 @@ void __global__ vanity_scan(curandState* state, int* keys_found, int* gpu, int* 
 
 
 		// sha512_final inlined
-		// 
+		//
 		// As update was effectively elimiated, the only time we do
 		// sha512_compress now is in the finalize function. We can also
 		// optimize this:
@@ -386,79 +375,45 @@ void __global__ vanity_scan(curandState* state, int* keys_found, int* gpu, int* 
 
 		// Code Until here runs at 87_000_000H/s still!
 
-		size_t keysize = 256;
-		b58enc(key, &keysize, publick, 32);
-
-		// Code Until here runs at 22_000_000H/s. b58enc badly needs optimization.
-
-		// We don't have access to strncmp/strlen here, I don't know
-		// what the efficient way of doing this on a GPU is, so I'll
-		// start with a dumb loop. There seem to be implementations out
-		// there of bignunm division done in parallel as a CUDA kernel
-		// so it might make sense to write a new parallel kernel to do
-		// this.
-
-                for (int i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); ++i) {
-
-                        for (int j = 0; j<prefix_letter_counts[i]; ++j) {
-
-				// it doesn't match this prefix, no need to continue
-				if ( !(prefixes[i][j] == '?') && !(prefixes[i][j] == key[j]) ) {
-					break;
-				}
-
-                                // we got to the end of the prefix pattern, it matched!
-                                if ( j == ( prefix_letter_counts[i] - 1) ) {
-                                        atomicAdd(keys_found, 1);
-                                        //size_t pkeysize = 256;
-                                        //b58enc(pkey, &pkeysize, seed, 32);
-                                       
-				        // SMITH	
-					// The 'key' variable is the public key in base58 'address' format
-                                        // We display the seed in hex
-
-					// Solana stores the keyfile as seed (first 32 bytes)
-					// followed by public key (last 32 bytes)
-					// as an array of decimal numbers in json format
-
-                                        printf("GPU %d MATCH %s - ", *gpu, key);
-                                        for(int n=0; n<sizeof(seed); n++) { 
-						printf("%02x",(unsigned char)seed[n]); 
-					}
-					printf("\n");
-					
-                                        printf("[");
-					for(int n=0; n<sizeof(seed); n++) { 
-						printf("%d,",(unsigned char)seed[n]); 
-					}
-                                        for(int n=0; n<sizeof(publick); n++) {
-					        if ( n+1==sizeof(publick) ) {	
-							printf("%d",publick[n]);
-						} else {
-							printf("%d,",publick[n]);
-						}
-					}
-                                        printf("]\n");
-
-					/*
-					printf("Public: ");
-                                        for(int n=0; n<sizeof(publick); n++) { printf("%d ",publick[n]); }
-					printf("\n");
-					printf("Private: ");
-                                        for(int n=0; n<sizeof(privatek); n++) { printf("%d ",privatek[n]); }
-					printf("\n");
-					printf("Seed: ");
-                                        for(int n=0; n<sizeof(seed); n++) { printf("%d ",seed[n]); }
-					printf("\n");
-                                        */
-
-                                        break;
-				}
-
-                        }
+		unsigned int match = 0;
+		unsigned long long int* pubkBIG = (unsigned long long int*)publick;
+		for (int i = 0; i < (32 / sizeof(unsigned long long int)); i++) {
+			char v = pubkBIG[i];
+			if (v == 0) {
+				match += sizeof(unsigned long long int) * 8;
+				continue;
+			}
+			int j = sizeof(unsigned long long int) * 8 - 1;
+			v = v >> 1;
+			while (v != 0) {
+				v = v >> 1;
+				j--;
+			}
+			match += j;
+			break;
 		}
 
-		// Code Until here runs at 22_000_000H/s. So the above is fast enough.
+		if (match > best_local) {
+			best_local = match;
+			unsigned int old = atomicMax(best_found, match);
+			if (match > old) {
+				unsigned char privateh[129] = {0};
+				for (int j = 0; j < 64; j++) {
+					unsigned char v = privatek[j];
+					int jj = j*2;
+					privateh[jj] = "0123456789abcdef"[v>>4];
+					privateh[jj+1] = "0123456789abcdef"[v&0xf];
+				}
+				unsigned char pubh[65] = {0};
+				for (int j = 0; j < 32; j++) {
+					unsigned char v = publick[j];
+					int jj = j*2;
+					pubh[jj] = "0123456789abcdef"[v>>4];
+					pubh[jj+1] = "0123456789abcdef"[v&0xf];
+				}
+				printf("GPU %d MATCH %u %s - %s\n", *gpu, match, pubh, privateh);
+			}
+		}
 
 		// Increment Seed.
 		// NOTE: This is horrifically insecure. Please don't use these
@@ -479,55 +434,4 @@ void __global__ vanity_scan(curandState* state, int* keys_found, int* gpu, int* 
 	// Copy Random State so that future calls of this kernel/thread/block
 	// don't repeat their sequences.
 	state[id] = localState;
-}
-
-bool __device__ b58enc(
-	char    *b58,
-       	size_t  *b58sz,
-       	uint8_t *data,
-       	size_t  binsz
-) {
-	// Base58 Lookup Table
-	const char b58digits_ordered[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-
-	const uint8_t *bin = data;
-	int carry;
-	size_t i, j, high, zcount = 0;
-	size_t size;
-	
-	while (zcount < binsz && !bin[zcount])
-		++zcount;
-	
-	size = (binsz - zcount) * 138 / 100 + 1;
-	uint8_t buf[256];
-	memset(buf, 0, size);
-	
-	for (i = zcount, high = size - 1; i < binsz; ++i, high = j)
-	{
-		for (carry = bin[i], j = size - 1; (j > high) || carry; --j)
-		{
-			carry += 256 * buf[j];
-			buf[j] = carry % 58;
-			carry /= 58;
-			if (!j) {
-				// Otherwise j wraps to maxint which is > high
-				break;
-			}
-		}
-	}
-	
-	for (j = 0; j < size && !buf[j]; ++j);
-	
-	if (*b58sz <= zcount + size - j) {
-		*b58sz = zcount + size - j + 1;
-		return false;
-	}
-	
-	if (zcount) memset(b58, '1', zcount);
-	for (i = zcount; j < size; ++i, ++j) b58[i] = b58digits_ordered[buf[j]];
-
-	b58[i] = '\0';
-	*b58sz = i + 1;
-	
-	return true;
 }
